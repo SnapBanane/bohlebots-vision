@@ -10,9 +10,7 @@ mask_window_name = "Farbmaske (bereinigt)"
 result_window_name = "Ergebnis (Maskiertes Bild)"
 
 # --- ROI und Circle Detection Parameter ---
-# Größe des quadratischen Bereichs um den Klick, in dem nach Kreisen gesucht wird
 SEARCH_ROI_SIZE = 100  # z.B. 100x100 Pixel Suchbereich
-# Fallback ROI Größe, falls kein Kreis gefunden wird (ähnlich wie vorherige ROI_SIZE)
 FALLBACK_SQUARE_ROI_SIZE = 25
 # Parameter für HoughCircles im Such-ROI (müssen ggf. angepasst werden)
 HC_DP = 1.2          # Inverse ratio of accumulator resolution
@@ -33,6 +31,66 @@ def nothing(x):
 
 def distance_pts(p1, p2):
     return math.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+
+def sample_area_hsv(hsv_frame, center_x, center_y, sample_radius=15):
+    """
+    Sample HSV values from a circular area around the center point.
+    Returns mean and standard deviation for more robust color detection.
+    """
+    h, w = hsv_frame.shape[:2]
+    
+    # Create circular mask for sampling
+    mask = np.zeros((h, w), dtype=np.uint8)
+    cv2.circle(mask, (center_x, center_y), sample_radius, 255, -1)
+    
+    # Extract HSV values within the mask
+    hsv_values = hsv_frame[mask > 0]
+    
+    if len(hsv_values) == 0:
+        return None, None
+    
+    # Calculate mean and std for each channel
+    mean_hsv = np.mean(hsv_values, axis=0)
+    std_hsv = np.std(hsv_values, axis=0)
+    
+    return mean_hsv, std_hsv
+
+def calculate_adaptive_tolerances(mean_hsv, std_hsv):
+    """
+    Calculate adaptive tolerances based on color characteristics and std deviation.
+    """
+    h_mean, s_mean, v_mean = mean_hsv
+    h_std, s_std, v_std = std_hsv if std_hsv is not None else (5, 20, 20)
+    
+    # Base tolerances (more generous than before)
+    h_base_tolerance = 20  # Increased from 10
+    s_base_tolerance = 80  # Increased from 70
+    v_base_tolerance = 80  # Increased from 70
+    
+    # Adaptive adjustments based on std deviation and color characteristics
+    h_tolerance = max(h_base_tolerance, int(h_std * 3))  # At least 3x std dev
+    s_tolerance = max(s_base_tolerance, int(s_std * 2.5))
+    v_tolerance = max(v_base_tolerance, int(v_std * 2.5))
+    
+    # Special handling for low saturation colors (more tolerance needed)
+    if s_mean < 50:
+        s_tolerance = min(255, int(s_tolerance * 1.5))
+        h_tolerance = min(179, int(h_tolerance * 1.3))
+    
+    # Special handling for dark colors (more V tolerance needed)
+    if v_mean < 80:
+        v_tolerance = min(255, int(v_tolerance * 1.4))
+    
+    # Special handling for colors near hue boundaries (red/pink region)
+    if h_mean < 15 or h_mean > 165:
+        h_tolerance = min(179, int(h_tolerance * 1.2))
+    
+    # Cap maximum tolerances to prevent overly broad detection
+    h_tolerance = min(h_tolerance, 35)
+    s_tolerance = min(s_tolerance, 120)
+    v_tolerance = min(v_tolerance, 120)
+    
+    return h_tolerance, s_tolerance, v_tolerance
 
 def mouse_callback(event, x_click, y_click, flags, param):
     global current_frame_for_callback, trackbar_window_name
@@ -88,46 +146,51 @@ def mouse_callback(event, x_click, y_click, flags, param):
                 print(f"Kreis gefunden bei ({best_circle_global[0]},{best_circle_global[1]}) mit Radius {best_circle_global[2]}")
 
 
-        # 3. Farbmittelung
+        # 3. Verbesserte Farbmittelung mit adaptiven Toleranzen
         avg_hsv_for_calibration = None
         sampled_bgr_for_display = None
 
         if best_circle_global:
-            # Mittelung innerhalb des erkannten Kreises
+            # Erweiterte Mittelung innerhalb des erkannten Kreises
             c_x, c_y, r = best_circle_global
-            circle_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
-            cv2.circle(circle_mask, (c_x, c_y), r, 255, -1)
             
-            if np.sum(circle_mask) > 0: # Sicherstellen, dass die Maske nicht leer ist
-                avg_hsv_for_calibration = cv2.mean(full_frame_hsv, mask=circle_mask)[:3] # Nur H, S, V
-                # Für die Anzeige der gesampelten Farbe, den Durchschnitt der BGR-Werte nehmen
+            # Sample from multiple areas for more robust detection
+            mean_hsv, std_hsv = sample_area_hsv(full_frame_hsv, c_x, c_y, min(r, 20))
+            
+            if mean_hsv is not None:
+                avg_hsv_for_calibration = mean_hsv
+                
+                # Calculate BGR for display
+                circle_mask = np.zeros((frame_height, frame_width), dtype=np.uint8)
+                cv2.circle(circle_mask, (c_x, c_y), r, 255, -1)
                 sampled_bgr_for_display = cv2.mean(current_frame_for_callback, mask=circle_mask)[:3]
             else:
                 print("Kreismaske war leer, falle zurück.")
-                best_circle_global = None # Erzwinge Fallback
+                best_circle_global = None
                 last_detected_circle_params = None
 
-
-        if not best_circle_global: # Fallback auf quadratische ROI
-            print("Kein passender Kreis gefunden. Nutze quadratische Fallback-ROI.")
-            half_fallback = FALLBACK_SQUARE_ROI_SIZE // 2
-            fx1 = max(0, x_click - half_fallback)
-            fy1 = max(0, y_click - half_fallback)
-            fx2 = min(frame_width -1 , x_click + half_fallback) # -1 da exklusiv in slicing
-            fy2 = min(frame_height -1, y_click + half_fallback)
-
-            if fx1 >= fx2 or fy1 >= fy2:
-                print("Fallback ROI ungültig.")
-                return
-
-            fallback_roi_bgr = current_frame_for_callback[fy1:fy2+1, fx1:fx2+1]
-            if fallback_roi_bgr.size > 0:
-                sampled_bgr_for_display = np.mean(fallback_roi_bgr, axis=(0,1))
-                fallback_roi_hsv = cv2.cvtColor(np.uint8([[sampled_bgr_for_display]]), cv2.COLOR_BGR2HSV)[0][0]
-                avg_hsv_for_calibration = fallback_roi_hsv
-                last_fallback_roi_rect = (fx1, fy1, (fx2+1)-fx1, (fy2+1)-fy1)
+        if not best_circle_global:
+            print("Kein passender Kreis gefunden. Nutze verbesserte quadratische Fallback-ROI.")
+            # Erweiterte Fallback-Abtastung
+            sample_size = max(FALLBACK_SQUARE_ROI_SIZE, 30)  # Größere Abtastung
+            mean_hsv, std_hsv = sample_area_hsv(full_frame_hsv, x_click, y_click, sample_size // 2)
+            
+            if mean_hsv is not None:
+                avg_hsv_for_calibration = mean_hsv
+                
+                # BGR für Anzeige berechnen
+                half_fallback = sample_size // 2
+                fx1 = max(0, x_click - half_fallback)
+                fy1 = max(0, y_click - half_fallback)
+                fx2 = min(frame_width - 1, x_click + half_fallback)
+                fy2 = min(frame_height - 1, y_click + half_fallback)
+                
+                if fx1 < fx2 and fy1 < fy2:
+                    fallback_roi_bgr = current_frame_for_callback[fy1:fy2+1, fx1:fx2+1]
+                    sampled_bgr_for_display = np.mean(fallback_roi_bgr, axis=(0,1))
+                    last_fallback_roi_rect = (fx1, fy1, (fx2+1)-fx1, (fy2+1)-fy1)
             else:
-                print("Fallback ROI war leer.")
+                print("Fallback-Abtastung fehlgeschlagen.")
                 return
         
         if avg_hsv_for_calibration is None:
@@ -138,10 +201,8 @@ def mouse_callback(event, x_click, y_click, flags, param):
 
         h_avg, s_avg, v_avg = int(avg_hsv_for_calibration[0]), int(avg_hsv_for_calibration[1]), int(avg_hsv_for_calibration[2])
 
-        # 4. Trackbars setzen
-        h_tolerance = 10
-        s_tolerance = 70 
-        v_tolerance = 70 
+        # 4. Adaptive Toleranzen berechnen
+        h_tolerance, s_tolerance, v_tolerance = calculate_adaptive_tolerances(avg_hsv_for_calibration, std_hsv if 'std_hsv' in locals() else None)
 
         h_min_new = max(0, h_avg - h_tolerance)
         h_max_new = min(179, h_avg + h_tolerance)
@@ -158,6 +219,7 @@ def mouse_callback(event, x_click, y_click, flags, param):
         cv2.setTrackbarPos("V_max", trackbar_window_name, v_max_new)
 
         print(f"Gesampelte Avg HSV: [{h_avg}, {s_avg}, {v_avg}]")
+        print(f"Adaptive Toleranzen: H=±{h_tolerance}, S=±{s_tolerance}, V=±{v_tolerance}")
         print(f"Trackbars gesetzt auf: H=[{h_min_new}-{h_max_new}], S=[{s_min_new}-{s_max_new}], V=[{v_min_new}-{v_max_new}]")
 
 
@@ -206,9 +268,23 @@ while True:
     lower_bound = np.array([h_min, s_min, v_min])
     upper_bound = np.array([h_max, s_max, v_max])
     mask = cv2.inRange(hsv_frame, lower_bound, upper_bound)
-    kernel = np.ones((5,5),np.uint8)
-    mask_cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    mask_cleaned = cv2.morphologyEx(mask_cleaned, cv2.MORPH_CLOSE, kernel)
+    
+    # Verbesserte morphologische Operationen für robustere Masken
+    kernel_small = np.ones((3,3), np.uint8)
+    kernel_medium = np.ones((5,5), np.uint8)
+    kernel_large = np.ones((7,7), np.uint8)
+    
+    # Entferne Rauschen
+    mask_cleaned = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small)
+    # Schließe kleine Löcher
+    mask_cleaned = cv2.morphologyEx(mask_cleaned, cv2.MORPH_CLOSE, kernel_medium)
+    # Erweitere die Bereiche leicht um kleine Lücken zu schließen
+    mask_cleaned = cv2.morphologyEx(mask_cleaned, cv2.MORPH_DILATE, kernel_small)
+    # Erodiere zurück zur ursprünglichen Größe
+    mask_cleaned = cv2.morphologyEx(mask_cleaned, cv2.MORPH_ERODE, kernel_small)
+    # Final: größere Schließoperation für zusammenhängende Bereiche
+    mask_cleaned = cv2.morphologyEx(mask_cleaned, cv2.MORPH_CLOSE, kernel_large)
+    
     result_frame = cv2.bitwise_and(frame, frame, mask=mask_cleaned)
 
     # Visualisierungen
