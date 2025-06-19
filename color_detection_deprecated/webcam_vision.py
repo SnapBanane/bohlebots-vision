@@ -7,7 +7,7 @@ import math
 color = (255,255,255)
 colors = {'blue': [np.array([84, 161, 45]), np.array([124, 255, 205])],
           'pink': [np.array([148, 38, 57]), np.array([179, 198, 217])],
-          'yellow': [np.array([5, 21, 65]), np.array([45, 181, 225])],
+          'yellow': [np.array([0, 59, 83]), np.array([40, 210, 243])],
           'red': [np.array([0, 120, 70]), np.array([10, 255, 255])],
           'green': [np.array([40, 80, 50]), np.array([80, 255, 255])] 
           }
@@ -29,7 +29,7 @@ def is_circle(contour):
         return False
     
     circularity = 4 * np.pi * area / (perimeter * perimeter)
-    if 0.7 <= circularity <= 1.2:
+    if 0.8 <= circularity <= 1.2:
         return True
     return False
 
